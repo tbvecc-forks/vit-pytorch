@@ -18,6 +18,7 @@
 9. [Dependencies, packaging, tests, tooling](#9-dependencies-packaging-tests-tooling)
 10. [Known issues (verified by reading the source)](#10-known-issues--verified-by-reading-the-source)
 11. [Practical guidance](#11-practical-guidance)
+12. [Study plan](#12-study-plan)
 
 ---
 
@@ -480,3 +481,126 @@ Every item below was confirmed by reading the cited lines. None were confirmed b
 3. Fix the one-line bugs: `qk_norm` head, `scalable_vit` unpack order, `sep_vit` kwargs, `xcit` condition, the VAT `rearrange`, the flash einsum pattern, the `na_vit_nested_tensor` `None > 0` comparison, and `vivit_with_moss` causal cls.
 4. Declare optional extras in `pyproject.toml` (`audio = [torchaudio]`, `siglip = [huggingface_hub, safetensors]`, plus `packaging`).
 5. Optionally factor shared primitives (`Attention`, `FeedForward`, sincos embeddings, `EMA`/`NetWrapper`) into a private `_layers.py`. This conflicts with the "one self-contained file per paper" philosophy, so it's a judgment call; tests (item 1) give most of the benefit without that trade-off.
+
+---
+
+## 12. Study plan
+
+A staged path from "what is a ViT" to "I can read any file here and spot what's wrong with it". Each stage lists what to read, what to do, and a checkpoint to test yourself on before moving on. The time estimates assume roughly 1–2 hours of focused work per session. Total: about 10–12 sessions.
+
+### Stage 0: setup (½ session)
+
+- **Environment:** `pip install -e '.[test]' jupyter`, then run `pytest`. All 4 tests should pass. A CPU is enough for every exercise up to Stage 6.
+- **Make a scratch folder** outside `vit_pytorch/` (e.g. `scratch/`) for your exercise scripts, so the package stays clean.
+- **Learn just enough einops:** `rearrange`, `repeat`, `reduce`, `pack`/`unpack`, and the `Rearrange` layer. The [einops basics tutorial](https://einops.rocks/1-einops-basics/) covers this. Every file in this repo depends on it.
+
+> ✅ **Checkpoint:** without running it, write the einops pattern that turns `(b, 3, 224, 224)` into 16×16 patches of shape `(b, 196, 768)`. Then compare it with `vit.py`'s `to_patch_embedding[0]`.
+
+### Stage 1: the reference ViT (2 sessions)
+
+- **Read:** the ViT paper (Dosovitskiy et al., 2020), sections 3.1 and 4.1. Then read `vit_pytorch/vit.py` line by line alongside [§4.1](#41-vit_pytorchvitpy--vit).
+- **Do:**
+  1. Instantiate a tiny `ViT` (`dim=64, depth=2, heads=4, image_size=32, patch_size=4`). Use forward hooks or `print` statements to record the tensor shape after every step in the §4.1 diagram.
+  2. Count parameters by hand for `Attention` and `FeedForward`, then check against `sum(p.numel() for p in m.parameters())`.
+  3. Try `num_classes=0` and `pool='mean'` and explain how the output shape changes and why the `cls_token` becomes `(0, dim)`.
+  4. Feed a 16×16 image into a model built for 32×32. Explain why it works, given `pos_embedding[:seq]`, and why a 64×64 image doesn't.
+  5. Train it on CIFAR-10 for a few epochs, or overfit a single batch of 32 images until loss ≈ 0. This shows the model actually learns.
+- **Read next:** `simple_vit.py`. Run `diff vit_pytorch/vit.py vit_pytorch/simple_vit.py` and list every difference: positional embedding, pooling, dropout, biases, head.
+
+> ✅ **Checkpoint:** explain why the norm sits *inside* `Attention`/`FeedForward` (pre-norm) and why there is one more `LayerNorm` at the end of `Transformer`. What does `to_latent` exist for? (Hint: §8 and `dino.py`.)
+
+### Stage 2: inspection tools and the "one idea per file" pattern (1 session)
+
+- **Read:** `recorder.py` and `extractor.py` (about 150 lines together), then [§8](#8-inspection-utilities-recorder-and-extractor).
+- **Do:**
+  1. Wrap your Stage-1 model in `Recorder`. Plot the cls token's attention over the patches for one image, as a heat-map reshaped to the patch grid.
+  2. Wrap a `SimpleViT` in `Recorder`. You should get `attns=None`; find the `isinstance` line that causes it.
+  3. Diff `simple_vit.py` against three ablations: `simple_vit_with_register_tokens.py`, `simple_vit_with_qk_norm.py` and `simple_vit_with_value_residual.py`. For each, write one sentence describing the idea and one naming the exact lines that implement it.
+- **Bug hunt:** in the `qk_norm` diff, find why the model never outputs `num_classes` logits (§10.1 #3), and fix it locally.
+
+> ✅ **Checkpoint:** given any `simple_vit_with_*.py`, you can locate the changed mechanism in under 5 minutes using `diff`.
+
+### Stage 3: classic ViT variants (2 sessions)
+
+Read these in order. Each one adds a single new concept on top of what you already know:
+
+| Order | File | Concept to extract |
+|---|---|---|
+| 1 | `efficient.py` | Dependency injection of the transformer. |
+| 2 | `vit_for_small_dataset.py` | Changing the tokenizer (SPT) and attention temperature (LSA). |
+| 3 | `deepvit.py` | Modifying the attention matrix after softmax. |
+| 4 | `cait.py` | Class-attention, LayerScale, layer-drop. |
+| 5 | `t2t.py` | `nn.Unfold` as a tokenizer; reuse of `vit.Transformer`. |
+| 6 | `cross_vit.py` | Multi-branch models; cross-attention between cls tokens. |
+| 7 | `ats_vit.py` | Dynamic token count, padding masks, `pad_sequence`. |
+| 8 | `learnable_memory_vit.py` | Freezing a backbone; attention masks as an API. |
+
+- **Do:** for 2–3 of these, write the shapes at each step, just as you did in Stage 1. For `ats_vit.py`, call it with `return_sampled_token_ids=True` and check that the token count shrinks at each depth.
+- **Bug hunt:** find the `xcit.py:47` condition that can never be true, and the tuple-`patch_size` crash in `vit_for_small_dataset.py` (§10.2).
+
+> ✅ **Checkpoint:** explain the difference between a cls token taking part in every layer (ViT) and a cls token only attending in the last layers (CaiT), and give one reason the paper prefers the latter.
+
+### Stage 4: hierarchical and convolutional hybrids (2 sessions)
+
+- **Read first:** [§6.3](#63-hierarchical--convolutional-hybrids-feature-maps-b-c-h-w). The mental switch is from token sequences `(b, n, d)` to feature maps `(b, c, h, w)`, where 1×1 convolutions act as linear layers.
+- **Read in order:**
+  1. `pit.py`: the smallest step, pooling between ViT stages.
+  2. `cvt.py`: conv projections, plus the `group_by_key_prefix_and_remove_prefix` kwargs trick.
+  3. `twins_svt.py`: local vs global attention, and PEG.
+  4. `max_vit.py`: block vs grid attention (compare the two `rearrange` patterns closely), MBConv, and relative position bias.
+- **Do:**
+  1. For `MaxViT`, print the feature-map shape after each stage for a 224×224 input.
+  2. Draw (on paper) which pixels a token can attend to in block attention vs grid attention, with `window_size=7`.
+- **Bug hunt:** compare the `layers.append` list and the `for` unpacking in `scalable_vit.py:216-228`, then work out the effective block order (§10.1 #6). Then find why `sep_vit.py`'s per-stage `window_size` is ignored.
+
+> ✅ **Checkpoint:** explain how each of CvT, Twins, CrossFormer and MaxViT gets positional information without a learned absolute positional embedding.
+
+### Stage 5: training wrappers and the encoder contract (2 sessions)
+
+- **Read:** the MAE paper (He et al., 2021), section 3. Then `mae.py`, `simmim.py` and [§7](#7-training--self-supervised-wrappers-and-the-encoder-contract).
+- **Do (this is the most valuable exercise in the plan):**
+  1. Run the README's MAE snippet. It should fail (§10.1 #1). Read the traceback and connect it to `git show fdaf7f9 -- vit_pytorch/vit.py`.
+  2. Fix `mae.py` so it works with **both** the 2-D (`vit.ViT`) and 3-D (`deepvit.DeepViT`) `pos_embedding` layouts. Write a pytest that builds each and checks that `loss.backward()` runs.
+  3. Pre-train a tiny ViT with MAE on CIFAR-10 for a few epochs. Then visualize the reconstruction of masked patches; you'll need to return `pred_pixel_values` yourself.
+- **Then read:** the DINO paper (Caron et al., 2021), section 3, followed by `dino.py`. Focus on `NetWrapper` (the hook), `EMA`/`update_moving_average`, centering, and `loss_fn`. Read `tests/test_dino_loss.py` to see why `log_softmax` replaced `softmax→log`.
+- **Bug hunt:** compare `dino.py`'s loss with `es_vit.py`'s. Find the numerical-stability fix that was applied to only one of them, and the `is_last` condition that is never true in the shared `MLP`.
+
+> ✅ **Checkpoint:** explain why the hook-based wrappers (Dino, Extractor) survived the `pos_embedding` refactor while the structural ones (MAE, SimMIM, MPP) broke. What would a stable encoder interface look like?
+
+### Stage 6: beyond 2-D images (2 sessions, pick the branches you care about)
+
+- **Video:** read `vit_3d.py` (a diff against `vit.py`), then `vivit.py`. Compare the two ViViT variants, and run one with a frame `mask`.
+  - **Bug hunt:** `vivit_with_moss.py`, where a causal temporal transformer is combined with a cls token at position 0 (§10.1 #4). Prove it empirically: two different videos give identical logits.
+- **Variable resolution:** read the NaViT paper (section 2), then `na_vit.py`. Feed it `[[img_64x64, img_32x48], [img_128x128]]` and print the block-diagonal attention mask.
+  - **Bug hunt:** construct `na_vit_nested_tensor.NaViT` with defaults and call it in training mode (§10.1 #5).
+- **N-D and masking:** read `vit_nd_masking.py`, then `vit_nd.py`. Use `ndim=3` with `causal_dims=(0,)` and visualize the mask from `get_nd_causal_mask_fn` for a tiny grid.
+  - Then read `vit_nd_rotary.py` and explain why it accepts any input size while `vit_nd.py` does not.
+- **Modern training-stability ideas (optional):** `normalized_vit.py` (nGPT), `vit_5.py`, `simple_vit_with_hyper_connections.py` and `looped_vit.py`. Read each alongside its paper's abstract and method figure.
+
+> ✅ **Checkpoint:** for one model per branch, state the input format, how positions are encoded, how attention is masked, and how the output is pooled.
+
+### Stage 7: capstone (1–2 sessions)
+
+Pick one of these:
+
+1. **Test-suite capstone.** Write `tests/test_smoke.py`: a parametrized test that builds each README-documented model at tiny size and runs forward + backward on CPU. Triage every failure against §10, and open a fix-up commit for 2–3 of them.
+2. **Research capstone.** Implement a new single-idea ablation as `simple_vit_with_<idea>.py`, following the repo conventions (§3): a paper link at the top, keyword-only constructor, a `__main__` smoke test, and a README section. Train it against `SimpleViT` on CIFAR-10 with the same budget and compare.
+3. **Refactor capstone.** Prototype a private `_layers.py` with shared `Attention`, `FeedForward` and sincos embeddings. Port 3 files to it, and write a short note on whether it is worth it given the one-file-per-paper philosophy.
+
+> ✅ **Final checkpoint:** open a file you've never read (e.g. `wwt.py` or `vat.py`). Within ~30 minutes you should be able to sketch its data flow, list its constructor's important knobs, and name at least one thing that looks suspicious.
+
+### Reference reading list (in plan order)
+
+| Stage | Paper |
+|---|---|
+| 1 | *An Image is Worth 16x16 Words* (ViT), arXiv 2010.11929 |
+| 1 | *Better plain ViT baselines for ImageNet-1k*, arXiv 2205.01580 |
+| 2 | *Vision Transformers Need Registers*, arXiv 2309.16588 |
+| 3 | *Going deeper with Image Transformers* (CaiT), arXiv 2103.17239 |
+| 3 | *Tokens-to-Token ViT*, arXiv 2101.11986 |
+| 4 | *CvT*, arXiv 2103.15808 · *MaxViT*, arXiv 2204.01697 |
+| 5 | *Masked Autoencoders Are Scalable Vision Learners* (MAE), arXiv 2111.06377 |
+| 5 | *Emerging Properties in Self-Supervised Vision Transformers* (DINO), arXiv 2104.14294 |
+| 6 | *ViViT*, arXiv 2103.15691 · *Patch n' Pack* (NaViT), arXiv 2307.06304 |
+
+The README's `## Citations` section has BibTeX for all of these and ~60 more.
