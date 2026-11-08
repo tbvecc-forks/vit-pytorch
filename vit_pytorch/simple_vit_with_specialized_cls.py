@@ -43,7 +43,9 @@ class Specialized(Module):
         x: Tensor | list[Tensor],
         token_lens: tuple[int, ...] = None
     ):
-        if is_tensor(x):
+        input_is_tensor = is_tensor(x)    # remembered here, as x is reassigned to the split tuple below
+
+        if input_is_tensor:
             assert exists(token_lens)
             x = x.split(token_lens, dim = 1)
 
@@ -51,7 +53,7 @@ class Specialized(Module):
 
         out = tuple(fn(t) for fn, t in zip(self.fns, x))
 
-        if is_tensor:
+        if input_is_tensor:
             out = cat(out, dim = 1)
 
         return out
