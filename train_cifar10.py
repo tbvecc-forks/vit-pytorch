@@ -19,15 +19,18 @@ usage:
     python train_cifar10.py --epochs 50
     python train_cifar10.py --epochs 0                  # only the single batch overfit check
     python train_cifar10.py --skip-overfit --save vit_cifar10.pt
+    python train_cifar10.py --log-dir runs/cifar10       # also write metrics.json for plotting
 """
 
 import argparse
+import json
 import math
 import time
 
 import numpy as np
 import torch
 import torch.nn.functional as F
+from pathlib import Path
 from torch.optim.lr_scheduler import LambdaLR
 
 from datasets import load_dataset
@@ -58,8 +61,31 @@ def parse_args():
     parser.add_argument('--seed', type = int, default = 0)
     parser.add_argument('--device', default = 'cuda' if torch.cuda.is_available() else 'cpu')
     parser.add_argument('--save', default = None, help = 'path to save the final model state dict')
+    parser.add_argument('--log-dir', default = None, help = 'directory to write metrics.json with per step and per epoch curves')
+    parser.add_argument('--log-every', type = int, default = 20, help = 'log the training loss every n steps')
 
     return parser.parse_args()
+
+# metrics
+
+class MetricsLogger:
+    # collects curves in memory and, if a log dir is given, rewrites metrics.json after every epoch
+
+    def __init__(self, log_dir = None, config = None):
+        self.path = Path(log_dir) / 'metrics.json' if log_dir is not None else None
+        self.metrics = dict(config = config or dict(), overfit = [], steps = [], epochs = [])
+
+        if self.path is not None:
+            self.path.parent.mkdir(parents = True, exist_ok = True)
+
+    def log(self, kind, **values):
+        self.metrics[kind].append(values)
+
+    def save(self):
+        if self.path is None:
+            return
+
+        self.path.write_text(json.dumps(self.metrics, indent = 2))
 
 # model
 
@@ -121,7 +147,7 @@ def augment(images, padding = 4):
 
 # phase 1 - overfit a single batch
 
-def overfit_one_batch(images, labels, steps, device, log_every = 50):
+def overfit_one_batch(images, labels, steps, device, logger, log_every = 50):
     print(f'\n=== phase 1: overfit a single batch of {images.shape[0]} images ===')
 
     model = make_vit(dropout = 0.).to(device)          # no dropout, no augmentation - we want memorization
@@ -135,6 +161,8 @@ def overfit_one_batch(images, labels, steps, device, log_every = 50):
         optimizer.zero_grad(set_to_none = True)
         loss.backward()
         optimizer.step()
+
+        logger.log('overfit', step = step, loss = loss.item())
 
         if step == 1 or step % log_every == 0 or step == steps:
             print(f'step {step:4d} | loss {loss.item():.4f}')
@@ -154,22 +182,26 @@ def overfit_one_batch(images, labels, steps, device, log_every = 50):
 @torch.no_grad()
 def evaluate(model, images, labels, batch_size = 1000):
     model.eval()
-    correct = 0
+    correct = total_loss = 0.
 
     for start in range(0, images.shape[0], batch_size):
         x = normalize(images[start:start + batch_size])
         y = labels[start:start + batch_size]
 
         with autocast(x.device):
-            correct += (model(x).argmax(dim = -1) == y).sum().item()
+            logits = model(x)
 
-    return correct / images.shape[0]
+        total_loss += F.cross_entropy(logits.float(), y, reduction = 'sum').item()
+        correct += (logits.argmax(dim = -1) == y).sum().item()
+
+    num_images = images.shape[0]
+    return total_loss / num_images, correct / num_images
 
 def autocast(device):
     # bfloat16 mixed precision on cuda, full precision elsewhere
     return torch.autocast(device_type = 'cuda', dtype = torch.bfloat16, enabled = device.type == 'cuda')
 
-def train(args, train_images, train_labels, test_images, test_labels):
+def train(args, train_images, train_labels, test_images, test_labels, logger):
     print(f'\n=== phase 2: train on CIFAR-10 ({train_images.shape[0]} train / {test_images.shape[0]} test images) ===')
 
     device = train_images.device
@@ -228,20 +260,41 @@ def train(args, train_images, train_labels, test_images, test_labels):
             optimizer.step()
             scheduler.step()
 
+            global_step = (epoch - 1) * steps_per_epoch + step + 1
+
+            if global_step % args.log_every == 0:
+                logger.log('steps', step = global_step, epoch = global_step / steps_per_epoch, loss = loss.item(), lr = scheduler.get_last_lr()[0])
+
             total_loss += loss.item() * y.shape[0]
             total_correct += (logits.argmax(dim = -1) == y).sum().item()
             total_seen += y.shape[0]
 
-        test_accuracy = evaluate(model, test_images, test_labels)
+        epoch_time = time.time() - start_time
+
+        test_loss, test_accuracy = evaluate(model, test_images, test_labels)
         best_accuracy = max(best_accuracy, test_accuracy)
+
+        logger.log(
+            'epochs',
+            epoch = epoch,
+            train_loss = total_loss / total_seen,
+            train_acc = total_correct / total_seen,
+            test_loss = test_loss,
+            test_acc = test_accuracy,
+            lr = scheduler.get_last_lr()[0],
+            seconds = epoch_time
+        )
+
+        logger.save()
 
         print(
             f'epoch {epoch:3d}/{args.epochs} | '
             f'train loss {total_loss / total_seen:.4f} | '
             f'train acc {total_correct / total_seen:.2%} | '
+            f'test loss {test_loss:.4f} | '
             f'test acc {test_accuracy:.2%} | '
             f'lr {scheduler.get_last_lr()[0]:.2e} | '
-            f'{time.time() - start_time:.1f}s'
+            f'{epoch_time:.1f}s'
         )
 
     print(f'\nfinal test accuracy {test_accuracy:.2%} | best {best_accuracy:.2%}')
@@ -256,6 +309,8 @@ def main():
     device = torch.device(args.device)
     print(f'device: {device}')
 
+    logger = MetricsLogger(args.log_dir, config = vars(args))
+
     load_start = time.time()
     train_images, train_labels, test_images, test_labels = load_cifar10(device)
     print(f'loaded CIFAR-10 in {time.time() - load_start:.1f}s')
@@ -265,13 +320,16 @@ def main():
             train_images[:args.overfit_batch_size],
             train_labels[:args.overfit_batch_size],
             steps = args.overfit_steps,
-            device = device
+            device = device,
+            logger = logger
         )
+
+        logger.save()
 
     if args.epochs <= 0:
         return
 
-    model = train(args, train_images, train_labels, test_images, test_labels)
+    model = train(args, train_images, train_labels, test_images, test_labels, logger)
 
     if args.save is not None:
         torch.save(model.state_dict(), args.save)
