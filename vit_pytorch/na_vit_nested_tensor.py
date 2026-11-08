@@ -9,7 +9,7 @@ import packaging.version as pkg_version
 from torch import nn, Tensor
 import torch.nn.functional as F
 from torch.nn import Module, ModuleList
-from torch.nested import nested_tensor
+from torch.nested import as_nested_tensor
 
 from einops import rearrange
 from einops.layers.torch import Rearrange
@@ -234,7 +234,7 @@ class NaViT(Module):
 
         seq_lens = torch.tensor([i.shape[0] for i in tokens], device = device)
 
-        if self.training and self.token_dropout_prob > 0:
+        if self.training and exists(self.token_dropout_prob) and self.token_dropout_prob > 0:
 
             keep_seq_lens = ((1. - self.token_dropout_prob) * seq_lens).int().clamp(min = 1)
 
@@ -271,7 +271,7 @@ class NaViT(Module):
 
         tokens = tokens + pos_embed
 
-        tokens = nested_tensor(tokens.split(seq_lens.tolist()), layout = torch.jagged, device = device)
+        tokens = as_nested_tensor(tokens.split(seq_lens.tolist()), layout = torch.jagged, device = device)
 
         # embedding dropout
 
@@ -286,7 +286,7 @@ class NaViT(Module):
 
         attn_pool_queries = [rearrange(self.attn_pool_queries, '... -> 1 ...')] * batch
 
-        attn_pool_queries = nested_tensor(attn_pool_queries, layout = torch.jagged)
+        attn_pool_queries = as_nested_tensor(attn_pool_queries, layout = torch.jagged)
 
         pooled = self.attn_pool(attn_pool_queries, tokens)
 

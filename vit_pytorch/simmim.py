@@ -3,6 +3,24 @@ from torch import nn
 import torch.nn.functional as F
 from einops import repeat
 
+# helpers
+
+def patch_pos_embedding(encoder, num_patches):
+    # supports encoders whose positional embedding is (n, d) - e.g. vit.ViT, SimpleViT
+    # as well as older ones with a leading singleton batch dimension (1, n, d)
+    # the first position is skipped when the encoder carries a cls token
+
+    pos_emb = encoder.pos_embedding
+
+    if pos_emb.ndim == 3:
+        pos_emb = pos_emb[0]
+
+    cls_token = getattr(encoder, 'cls_token', None)
+    has_cls = cls_token is not None and cls_token.numel() > 0
+
+    offset = int(has_cls)
+    return pos_emb[offset:(offset + num_patches)]
+
 class SimMIM(nn.Module):
     def __init__(
         self,
@@ -43,7 +61,7 @@ class SimMIM(nn.Module):
 
         # get positions
 
-        pos_emb = self.encoder.pos_embedding[:, 1:(num_patches + 1)]
+        pos_emb = patch_pos_embedding(self.encoder, num_patches).to(device)
 
         # patch to encoder tokens and add positions
 

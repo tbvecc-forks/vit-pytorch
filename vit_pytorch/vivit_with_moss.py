@@ -399,13 +399,14 @@ class ViViT(Module):
             x = moss_pooled
 
         # append temporal cls tokens
+        # placed at the end of the sequence, so that it can attend to all frames when the temporal transformer is causal
 
         if self.has_cls:
             temporal_cls_tokens = repeat(self.temporal_cls_token, '1 1 d -> b 1 d', b = batch)
-            x = torch.cat((temporal_cls_tokens, x), dim = 1)
+            x = torch.cat((x, temporal_cls_tokens), dim = 1)
 
             if exists(temporal_mask):
-                temporal_mask = F.pad(temporal_mask, (1, 0), value = True)
+                temporal_mask = F.pad(temporal_mask, (0, 1), value = True)
 
         # attend across time
 
@@ -413,7 +414,7 @@ class ViViT(Module):
 
         # temporal pooling
 
-        x = x[:, 0] if self.has_cls else reduce(x, 'b f d -> b d', 'mean')
+        x = x[:, -1] if self.has_cls else reduce(x, 'b f d -> b d', 'mean')
 
         return self.mlp_head(x)
 

@@ -41,8 +41,9 @@ class DepthWiseConv2d(nn.Module):
 class FeedForward(nn.Module):
     def __init__(self, dim, hidden_dim, dropout = 0.):
         super().__init__()
+        self.norm = nn.LayerNorm(dim)
+
         self.net = nn.Sequential(
-            nn.LayerNorm(dim),
             nn.Conv2d(dim, hidden_dim, 1),
             nn.Hardswish(),
             DepthWiseConv2d(hidden_dim, hidden_dim, 3, padding = 1),
@@ -53,6 +54,7 @@ class FeedForward(nn.Module):
         )
     def forward(self, x):
         h = w = int(sqrt(x.shape[-2]))
+        x = self.norm(x)
         x = rearrange(x, 'b (h w) c -> b c h w', h = h, w = w)
         x = self.net(x)
         x = rearrange(x, 'b c h w -> b (h w) c')

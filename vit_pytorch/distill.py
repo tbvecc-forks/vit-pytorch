@@ -25,9 +25,19 @@ class DistillMixin:
         x = self.to_patch_embedding(img)
         b, n, _ = x.shape
 
-        cls_tokens = repeat(self.cls_token, 'n d -> b n d', b = b)
+        cls_token, pos_embedding = self.cls_token, self.pos_embedding
+
+        # older encoders (T2TViT, EfficientViT) store these with a leading singleton batch dimension
+
+        if cls_token.ndim == 3:
+            cls_token = rearrange(cls_token, '1 n d -> n d')
+
+        if pos_embedding.ndim == 3:
+            pos_embedding = rearrange(pos_embedding, '1 n d -> n d')
+
+        cls_tokens = repeat(cls_token, 'n d -> b n d', b = b)
         x = torch.cat((cls_tokens, x), dim = 1)
-        x += self.pos_embedding[:(n + 1)]
+        x = x + pos_embedding[:x.shape[1]]
 
         if distilling:
             distill_tokens = repeat(distill_token, 'n d -> b n d', b = b)

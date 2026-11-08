@@ -71,7 +71,7 @@ class Attend(nn.Module):
 
         # similarity
 
-        sim = einsum("b h i d, b j d -> b h i j", q, k) * scale
+        sim = einsum(q, k, "b h i d, b h j d -> b h i j") * scale
 
         # attention
 
@@ -79,7 +79,7 @@ class Attend(nn.Module):
 
         # aggregate values
 
-        out = einsum("b h i j, b j d -> b h i d", attn, v)
+        out = einsum(attn, v, "b h i j, b h j d -> b h i d")
 
         return out
 

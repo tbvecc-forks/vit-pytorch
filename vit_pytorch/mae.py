@@ -5,6 +5,24 @@ from einops import repeat
 
 from vit_pytorch.vit import Transformer
 
+# helpers
+
+def patch_pos_embedding(encoder, num_patches):
+    # supports encoders whose positional embedding is (n, d) - e.g. vit.ViT, SimpleViT
+    # as well as older ones with a leading singleton batch dimension (1, n, d)
+    # the first position is skipped when the encoder carries a cls token
+
+    pos_emb = encoder.pos_embedding
+
+    if pos_emb.ndim == 3:
+        pos_emb = pos_emb[0]
+
+    cls_token = getattr(encoder, 'cls_token', None)
+    has_cls = cls_token is not None and cls_token.numel() > 0
+
+    offset = int(has_cls)
+    return pos_emb[offset:(offset + num_patches)]
+
 class MAE(nn.Module):
     def __init__(
         self,
@@ -49,10 +67,7 @@ class MAE(nn.Module):
         # patch to encoder tokens and add positions
 
         tokens = self.patch_to_emb(patches)
-        if self.encoder.pool == "cls":
-            tokens += self.encoder.pos_embedding[:, 1:(num_patches + 1)]
-        elif self.encoder.pool == "mean":
-            tokens += self.encoder.pos_embedding.to(device, dtype=tokens.dtype)
+        tokens = tokens + patch_pos_embedding(self.encoder, num_patches).to(tokens)
 
         # calculate of patches needed to be masked, and get random indices, dividing it up for mask vs unmasked
 
