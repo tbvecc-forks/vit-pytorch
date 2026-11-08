@@ -20,6 +20,7 @@ usage:
     python train_cifar10.py --epochs 0                  # only the single batch overfit check
     python train_cifar10.py --skip-overfit --save vit_cifar10.pt
     python train_cifar10.py --log-dir runs/cifar10       # also write metrics.json for plotting
+    python train_cifar10.py --norm post                  # post-norm transformer blocks instead of pre-norm
 """
 
 import argparse
@@ -31,6 +32,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from pathlib import Path
+from torch import nn
+from torch.nn import Module, ModuleList
 from torch.optim.lr_scheduler import LambdaLR
 
 from datasets import load_dataset
@@ -58,6 +61,7 @@ def parse_args():
     parser.add_argument('--overfit-steps', type = int, default = 500)
     parser.add_argument('--skip-overfit', action = 'store_true')
 
+    parser.add_argument('--norm', choices = ('pre', 'post'), default = 'pre', help = 'pre-norm: x + f(LN(x)), final LN | post-norm: LN(x + f(x)), no final LN')
     parser.add_argument('--seed', type = int, default = 0)
     parser.add_argument('--device', default = 'cuda' if torch.cuda.is_available() else 'cpu')
     parser.add_argument('--save', default = None, help = 'path to save the final model state dict')
@@ -89,10 +93,40 @@ class MetricsLogger:
 
 # model
 
-def make_vit(dropout = 0.1):
+class PostNormTransformer(Module):
+    """
+    post-norm transformer, as in the original Transformer (Vaswani et al. 2017)
+
+        pre-norm  (vit.py):  x = x + f(LayerNorm(x))   ... and a final LayerNorm after the last block
+        post-norm (this):    x = LayerNorm(x + f(x))   ... output already normalized, no final LayerNorm
+
+    reuses the attention and feedforward blocks of a vit.Transformer, removing the LayerNorm each one applies to its input
+    """
+
+    def __init__(self, transformer):
+        super().__init__()
+        dim = transformer.norm.normalized_shape[0]
+
+        self.layers = transformer.layers
+        self.norms = ModuleList([])
+
+        for attn, ff in self.layers:
+            attn.norm = nn.Identity()
+            ff.net[0] = nn.Identity()
+
+            self.norms.append(ModuleList([nn.LayerNorm(dim), nn.LayerNorm(dim)]))
+
+    def forward(self, x):
+        for (attn, ff), (attn_norm, ff_norm) in zip(self.layers, self.norms):
+            x = attn_norm(attn(x) + x)
+            x = ff_norm(ff(x) + x)
+
+        return x
+
+def make_vit(dropout = 0.1, norm = 'pre'):
     # 32x32 images with 4x4 patches -> 8x8 = 64 patch tokens + 1 cls token
 
-    return ViT(
+    vit = ViT(
         image_size = 32,
         patch_size = 4,
         num_classes = 10,
@@ -104,6 +138,11 @@ def make_vit(dropout = 0.1):
         dropout = dropout,
         emb_dropout = dropout
     )
+
+    if norm == 'post':
+        vit.transformer = PostNormTransformer(vit.transformer)
+
+    return vit
 
 # data
 
@@ -147,10 +186,10 @@ def augment(images, padding = 4):
 
 # phase 1 - overfit a single batch
 
-def overfit_one_batch(images, labels, steps, device, logger, log_every = 50):
+def overfit_one_batch(images, labels, steps, device, logger, norm = 'pre', log_every = 50):
     print(f'\n=== phase 1: overfit a single batch of {images.shape[0]} images ===')
 
-    model = make_vit(dropout = 0.).to(device)          # no dropout, no augmentation - we want memorization
+    model = make_vit(dropout = 0., norm = norm).to(device)          # no dropout, no augmentation - we want memorization
     optimizer = torch.optim.AdamW(model.parameters(), lr = 1e-3, weight_decay = 0.)
 
     x, y = normalize(images), labels
@@ -205,10 +244,10 @@ def train(args, train_images, train_labels, test_images, test_labels, logger):
     print(f'\n=== phase 2: train on CIFAR-10 ({train_images.shape[0]} train / {test_images.shape[0]} test images) ===')
 
     device = train_images.device
-    model = make_vit().to(device)
+    model = make_vit(norm = args.norm).to(device)
 
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f'model: ViT with {num_params:,} trainable parameters')
+    print(f'model: {args.norm}-norm ViT with {num_params:,} trainable parameters')
 
     # no weight decay on biases, norms, cls token and positional embedding
 
@@ -256,14 +295,14 @@ def train(args, train_images, train_labels, test_images, test_labels, logger):
 
             optimizer.zero_grad(set_to_none = True)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.)
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.)     # returns the norm before clipping
             optimizer.step()
             scheduler.step()
 
             global_step = (epoch - 1) * steps_per_epoch + step + 1
 
             if global_step % args.log_every == 0:
-                logger.log('steps', step = global_step, epoch = global_step / steps_per_epoch, loss = loss.item(), lr = scheduler.get_last_lr()[0])
+                logger.log('steps', step = global_step, epoch = global_step / steps_per_epoch, loss = loss.item(), lr = scheduler.get_last_lr()[0], grad_norm = grad_norm.item())
 
             total_loss += loss.item() * y.shape[0]
             total_correct += (logits.argmax(dim = -1) == y).sum().item()
@@ -321,7 +360,8 @@ def main():
             train_labels[:args.overfit_batch_size],
             steps = args.overfit_steps,
             device = device,
-            logger = logger
+            logger = logger,
+            norm = args.norm
         )
 
         logger.save()
