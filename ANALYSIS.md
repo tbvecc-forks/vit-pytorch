@@ -1,7 +1,7 @@
 # vit-pytorch — Codebase Analysis
 
 > Scope: the full `vit_pytorch` package (85 modules, ~20.9k LoC), tests, packaging, example notebook and README, at commit `42298e1` (v1.26.14, 2026-11-07).
-> Method: every module was read in full. Torch could not be installed in the analysis environment, so **nothing here was executed**. Findings come from static reading. Every bug listed in [§10](#10-known-issues--verified-by-reading-the-source) was re-checked against the source lines it cites.
+> Method: every module was read in full and every bug listed in [§10](#10-known-issues--verified-by-reading-the-source) was re-checked against the source lines it cites. Items §10.1 #1, #2, #3, #4, #5, #7 and #10 were also **reproduced at runtime** (torch 2.5.0+cu124, einops 0.8.2). Everything else comes from static reading.
 
 ---
 
@@ -409,22 +409,22 @@ That is the whole suite, for 85 modules. There is no CI config in this fork (`.g
 
 ## 10. Known issues (verified by reading the source)
 
-Every item below was confirmed by reading the cited lines. None were confirmed by execution (see the note at the top).
+Every item below was confirmed by reading the cited lines. Items marked **▶ reproduced** were also triggered at runtime (torch 2.5.0+cu124, einops 0.8.2), with the error shown. The rest have not been executed.
 
 ### 10.1 High impact (wrong results or a crash on the default / documented path)
 
 | # | Location | Issue |
 |---|---|---|
-| 1 | `mae.py:53`, `simmim.py:46`, `mpp.py` | Index `pos_embedding[:, 1:n+1]` and use 3-D `cls_token`; incompatible with the 2-D layout `vit.ViT` has used since `fdaf7f9`. `MAE(ViT(pool='cls'))`, the README example, breaks. See §7.1. |
-| 2 | `distill.py:28` | `repeat(cls_token, 'n d -> b n d')` fails for `DistillableT2TViT` / `DistillableEfficientViT`, whose `cls_token` is `(1,1,dim)` (`t2t.py:52`, `efficient.py:26`). |
-| 3 | `simple_vit_with_qk_norm.py:129` | `self.linear_head = nn.LayerNorm(dim)`: no projection to `num_classes`; outputs `(b, dim)`. |
-| 4 | `vivit_with_moss.py:303,337,405,416` | Default `moss_causal=True` makes the temporal transformer causal while the cls token sits at position 0 and is read out with `x[:, 0]`, so with `pool='cls'` the logits cannot depend on the video. |
-| 5 | `na_vit_nested_tensor.py:150,237` (also `_3d`) | `token_dropout_prob=None` by default, but `self.token_dropout_prob > 0` is evaluated in training mode → `TypeError`. Also builds inputs with `nested_tensor(...)` (L274/289), which creates a new leaf and likely cuts gradients to patch/pos embeddings and pool queries. |
+| 1 | `mae.py:53`, `simmim.py:46`, `mpp.py` | Index `pos_embedding[:, 1:n+1]` and use 3-D `cls_token`; incompatible with the 2-D layout `vit.ViT` has used since `fdaf7f9`. `MAE(ViT(pool='cls'))`, the README example, breaks. See §7.1. **▶ reproduced:** MAE and SimMIM raise `RuntimeError: size of tensor a (64) must match … b (63)`; `MAE(ViT(pool='mean'))` runs. |
+| 2 | `distill.py:28` | `repeat(cls_token, 'n d -> b n d')` fails for `DistillableT2TViT` / `DistillableEfficientViT`, whose `cls_token` is `(1,1,dim)` (`t2t.py:52`, `efficient.py:26`). **▶ reproduced** (`DistillableT2TViT`: `EinopsError`). |
+| 3 | `simple_vit_with_qk_norm.py:129` | `self.linear_head = nn.LayerNorm(dim)`: no projection to `num_classes`; outputs `(b, dim)`. **▶ reproduced:** `num_classes=10, dim=64` gives output shape `(2, 64)`. |
+| 4 | `vivit_with_moss.py:303,337,405,416` | Default `moss_causal=True` makes the temporal transformer causal while the cls token sits at position 0 and is read out with `x[:, 0]`, so with `pool='cls'` the logits cannot depend on the video. **▶ reproduced:** two random videos give identical logits in eval mode. |
+| 5 | `na_vit_nested_tensor.py:150,237` (also `_3d`) | `token_dropout_prob=None` by default, but `self.token_dropout_prob > 0` is evaluated in training mode → `TypeError`. Also builds inputs with `nested_tensor(...)` (L274/289), which creates a new leaf and likely cuts gradients to patch/pos embeddings and pool queries. **▶ reproduced** (the `TypeError`; the gradient issue was not tested). |
 | 6 | `scalable_vit.py:216-228` | Layers are built as `[ssa, ff, peg, ff, iwsa]` but unpacked as `ssa, ff1, peg, iwsa, ff2`. The effective order is SSA→FF→PEG→FF→IWSA (no FF after windowed attention). Runs silently. |
-| 7 | `local_vit.py:45,56` | `LayerNorm(dim)` applied after rearranging to `b c h w`, so it normalizes the width axis. This should crash unless grid width equals `dim`. |
+| 7 | `local_vit.py:45,56` | `LayerNorm(dim)` applied after rearranging to `b c h w`, so it normalizes the width axis. This crashes unless grid width equals `dim`. **▶ reproduced** (`RuntimeError: Given normalized_shape=[64] … got input of size [2, 64, 8, 8]`). |
 | 8 | `vat.py:376`, `vaat.py:566`, `vat_siglip.py:360` | `rearrange(x, 'b 1 c h w')` has no `->`, so the single-view 4-D input path crashes. |
 | 9 | `vat.py:38-44` (+ vaat, vat_siglip) | FiLM zero-inits both γ and β and applies `tokens*γ + β`. With `tasks` passed, the token stream is zeroed at init (the usual form is `tokens*(1+γ)+β`). |
-| 10 | `simple_flash_attn_vit.py:74,82`, `…_3d.py:69,77` | Non-flash path uses `einsum("b h i d, b j d -> …")` on 4-D k/v. `use_flash=False` (and non-CUDA fallbacks) should fail. The latest commit (`53334b3`) fixed the missing `einsum` import but not the pattern. |
+| 10 | `simple_flash_attn_vit.py:74,82`, `…_3d.py:69,77` | Non-flash path calls `einops.einsum("pattern", q, k)` with the pattern *first*, but einops requires it *last*; the pattern itself (`b j d` for 4-D k/v) is also wrong. `use_flash=False` (and non-CUDA fallbacks) fail. The latest commit (`53334b3`) fixed the missing `einsum` import but not the call. **▶ reproduced** (`ValueError: The last argument passed to einops.einsum must be a string`). |
 | 11 | `levjepa.py` (~L421) | Concatenates global views (`image_size`) and local views (`local_size`), so it crashes unless the two are equal. Batched torchvision transforms give every view the same crop. |
 
 ### 10.2 Medium (wrong hyper-parameter plumbing, silent no-ops)
@@ -490,7 +490,7 @@ A staged path from "what is a ViT" to "I can read any file here and spot what's 
 
 ### Stage 0: setup (½ session)
 
-- **Environment:** `pip install -e '.[test]' jupyter`, then run `pytest`. All 4 tests should pass. A CPU is enough for every exercise up to Stage 6.
+- **Environment:** `pip install -e '.[test]' jupyter`, then run `pytest`. All 5 tests should pass (4 test functions; one is parametrized over fp16/bf16). A CPU is enough for every exercise up to Stage 6.
 - **Make a scratch folder** outside `vit_pytorch/` (e.g. `scratch/`) for your exercise scripts, so the package stays clean.
 - **Learn just enough einops:** `rearrange`, `repeat`, `reduce`, `pack`/`unpack`, and the `Rearrange` layer. The [einops basics tutorial](https://einops.rocks/1-einops-basics/) covers this. Every file in this repo depends on it.
 
