@@ -15,6 +15,9 @@ usage:
     python plot_ablation.py runs/norm-ablation
     python plot_ablation.py runs/norm-ablation pre post      # optional variant order, which also fixes the colors
 
+variants named pre / post are labelled pre-norm / post-norm. variants named <model>-<norm> (model vit or small) compare
+both models, e.g. vit-pre, vit-post, small-pre, small-post. small (vit_for_small_dataset.ViT) runs are drawn dashed
+
 writes accuracy.png, loss.png, grad_norm.png, overfit.png and summary.md into the given directory
 """
 
@@ -31,14 +34,16 @@ import matplotlib.pyplot as plt
 import matplotlib.ticker
 
 # style - light chart surface, recessive grid and axes, text in text colors
-# variants take categorical slots in fixed order: blue, orange, aqua
+# variants take categorical slots in fixed order: blue, orange, aqua, yellow
 
 SURFACE = '#fcfcfb'
 TEXT_PRIMARY = '#0b0b0b'
 TEXT_SECONDARY = '#52514e'
 GRID = '#e4e3df'
 
-SERIES = ['#2a78d6', '#eb6834', '#1baf7a']
+SERIES = ['#2a78d6', '#eb6834', '#1baf7a', '#eda100']
+
+MODEL_LABELS = dict(vit = 'ViT', small = 'SPT+LSA ViT')
 
 plt.rcParams.update({
     'figure.facecolor': SURFACE,
@@ -62,6 +67,34 @@ plt.rcParams.update({
 })
 
 SEED_NOTE = 'thin lines: individual seeds · thick line: mean across seeds'
+
+# labels
+
+def variant_label(variant):
+    # 'pre' -> 'pre-norm', 'small-post' -> 'SPT+LSA ViT post-norm'
+
+    *model, norm = variant.split('-')
+    norm_label = f'{norm}-norm' if norm in ('pre', 'post') else norm
+
+    if len(model) == 0:
+        return norm_label
+
+    model = '-'.join(model)
+    return f'{MODEL_LABELS.get(model, model)} {norm_label}'
+
+def variant_linestyle(variant):
+    return '--' if variant.startswith('small-') else '-'
+
+def comparison_title(variants):
+    names = list(variants)
+
+    if set(names) <= {'pre', 'post'}:
+        return 'pre-norm vs post-norm'
+
+    if len(names) == 2:
+        return ' vs '.join(variant_label(name) for name in names)
+
+    return 'ViT vs SPT+LSA ViT, pre-norm and post-norm'
 
 # data
 
@@ -116,12 +149,12 @@ def plot_variants(ax, variants, get_x, get_y, smooth = False, markers = False):
             ys = [ema(y) for y in ys]
 
         for x, y in zip(xs, ys):
-            ax.plot(x, y, color = color, linewidth = 0.9, alpha = 0.35)
+            ax.plot(x, y, color = color, linewidth = 0.9, alpha = 0.35, linestyle = variant_linestyle(variant))
 
         mean_y = mean_curve(ys)
         marker_kwargs = dict(marker = 'o', markersize = 4, markeredgecolor = SURFACE, markeredgewidth = 1.) if markers else dict()
 
-        ax.plot(xs[0][:len(mean_y)], mean_y, color = color, linewidth = 2., label = f'{variant}-norm', **marker_kwargs)
+        ax.plot(xs[0][:len(mean_y)], mean_y, color = color, linewidth = 2., label = variant_label(variant), linestyle = variant_linestyle(variant), **marker_kwargs)
 
 def save(fig, path):
     fig.savefig(path)
@@ -131,7 +164,7 @@ def save(fig, path):
 # charts
 
 def plot_accuracy(variants, out_dir):
-    fig, (train_ax, test_ax) = new_figure('Accuracy: pre-norm vs post-norm', SEED_NOTE + ' · train accuracy is on augmented batches with dropout', ncols = 2)
+    fig, (train_ax, test_ax) = new_figure(f'Accuracy: {comparison_title(variants)}', SEED_NOTE + ' · train accuracy is on augmented batches with dropout', ncols = 2)
 
     epoch_x = lambda run: [m['epoch'] for m in run['epochs']]
 
@@ -150,7 +183,7 @@ def plot_accuracy(variants, out_dir):
 
 def plot_loss(variants, out_dir):
     fig, (train_ax, test_ax) = new_figure(
-        'Loss: pre-norm vs post-norm',
+        f'Loss: {comparison_title(variants)}',
         SEED_NOTE + '\ntrain: per step, EMA-smoothed, includes label smoothing · test: plain cross-entropy per epoch',
         ncols = 2
     )
@@ -168,7 +201,7 @@ def plot_loss(variants, out_dir):
     save(fig, out_dir / 'loss.png')
 
 def plot_grad_norm(variants, out_dir):
-    fig, (ax,) = new_figure('Gradient norm: pre-norm vs post-norm', SEED_NOTE + '\nglobal gradient norm before clipping, per step, EMA-smoothed, log scale')
+    fig, (ax,) = new_figure(f'Gradient norm: {comparison_title(variants)}', SEED_NOTE + '\nglobal gradient norm before clipping, per step, EMA-smoothed, log scale')
 
     plot_variants(ax, variants, lambda run: [m['epoch'] for m in run['steps']], lambda run: [m['grad_norm'] for m in run['steps']], smooth = True)
 
@@ -176,7 +209,7 @@ def plot_grad_norm(variants, out_dir):
     ax.annotate('clip threshold 1.0', (ax.get_xlim()[1], 1.), xytext = (6, 0), textcoords = 'offset points', va = 'center', fontsize = 9, color = TEXT_SECONDARY, annotation_clip = False)
 
     ax.set_yscale('log')
-    ax.yaxis.set_major_locator(matplotlib.ticker.FixedLocator([1., 1.2, 1.4, 1.6, 1.8, 2.]))
+    ax.yaxis.set_major_locator(matplotlib.ticker.FixedLocator([0.8, 0.9, 1., 1.2, 1.4, 1.6, 1.8, 2.]))
     ax.yaxis.set_major_formatter(matplotlib.ticker.FormatStrFormatter('%.1f'))
     ax.yaxis.set_minor_locator(matplotlib.ticker.NullLocator())
     ax.set_xlabel('epoch')
@@ -216,10 +249,10 @@ def write_summary(variants, out_dir):
             final = epochs[-1]['test_acc']
             best = max(m['test_acc'] for m in epochs)
             finals.append(final)
-            lines.append(f'| {variant}-norm | {run["config"]["seed"]} | {final:.2%} | {best:.2%} | {epochs[-1]["test_loss"]:.4f} |')
+            lines.append(f'| {variant_label(variant)} | {run["config"]["seed"]} | {final:.2%} | {best:.2%} | {epochs[-1]["test_loss"]:.4f} |')
 
         spread = f' ± {statistics.stdev(finals):.2%}' if len(finals) > 1 else ''
-        lines.append(f'| **{variant}-norm mean** | | **{statistics.fmean(finals):.2%}**{spread} | | |')
+        lines.append(f'| **{variant_label(variant)} mean** | | **{statistics.fmean(finals):.2%}**{spread} | | |')
 
     path = out_dir / 'summary.md'
     path.write_text('\n'.join(lines) + '\n')

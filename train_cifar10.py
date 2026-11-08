@@ -21,6 +21,7 @@ usage:
     python train_cifar10.py --skip-overfit --save vit_cifar10.pt
     python train_cifar10.py --log-dir runs/cifar10       # also write metrics.json for plotting
     python train_cifar10.py --norm post                  # post-norm transformer blocks instead of pre-norm
+    python train_cifar10.py --model small                # vit_for_small_dataset.ViT (shifted patch tokenization + locality self-attention)
 """
 
 import argparse
@@ -39,6 +40,7 @@ from torch.optim.lr_scheduler import LambdaLR
 from datasets import load_dataset
 
 from vit_pytorch import ViT
+from vit_pytorch.vit_for_small_dataset import ViT as SmallDatasetViT
 
 # constants
 
@@ -61,6 +63,7 @@ def parse_args():
     parser.add_argument('--overfit-steps', type = int, default = 500)
     parser.add_argument('--skip-overfit', action = 'store_true')
 
+    parser.add_argument('--model', choices = ('vit', 'small'), default = 'vit', help = 'vit: vit.ViT | small: vit_for_small_dataset.ViT (SPT + LSA)')
     parser.add_argument('--norm', choices = ('pre', 'post'), default = 'pre', help = 'pre-norm: x + f(LN(x)), final LN | post-norm: LN(x + f(x)), no final LN')
     parser.add_argument('--seed', type = int, default = 0)
     parser.add_argument('--device', default = 'cuda' if torch.cuda.is_available() else 'cpu')
@@ -100,12 +103,14 @@ class PostNormTransformer(Module):
         pre-norm  (vit.py):  x = x + f(LayerNorm(x))   ... and a final LayerNorm after the last block
         post-norm (this):    x = LayerNorm(x + f(x))   ... output already normalized, no final LayerNorm
 
-    reuses the attention and feedforward blocks of a vit.Transformer, removing the LayerNorm each one applies to its input
+    reuses the attention and feedforward blocks of a vit.Transformer or vit_for_small_dataset.Transformer,
+    removing the LayerNorm each one applies to its input. vit_for_small_dataset.Transformer has no final LayerNorm
+    (its mlp_head starts with one instead, which is kept), so for that model only the per block norms move
     """
 
     def __init__(self, transformer):
         super().__init__()
-        dim = transformer.norm.normalized_shape[0]
+        dim = transformer.layers[0][0].norm.normalized_shape[0]
 
         self.layers = transformer.layers
         self.norms = ModuleList([])
@@ -123,10 +128,13 @@ class PostNormTransformer(Module):
 
         return x
 
-def make_vit(dropout = 0.1, norm = 'pre'):
+def make_vit(dropout = 0.1, norm = 'pre', model = 'vit'):
     # 32x32 images with 4x4 patches -> 8x8 = 64 patch tokens + 1 cls token
+    # both models take the same hyperparameters, so 'small' differs only in the tokenizer (SPT) and attention (LSA)
 
-    vit = ViT(
+    vit_class = SmallDatasetViT if model == 'small' else ViT
+
+    vit = vit_class(
         image_size = 32,
         patch_size = 4,
         num_classes = 10,
@@ -186,10 +194,10 @@ def augment(images, padding = 4):
 
 # phase 1 - overfit a single batch
 
-def overfit_one_batch(images, labels, steps, device, logger, norm = 'pre', log_every = 50):
+def overfit_one_batch(images, labels, steps, device, logger, norm = 'pre', model_name = 'vit', log_every = 50):
     print(f'\n=== phase 1: overfit a single batch of {images.shape[0]} images ===')
 
-    model = make_vit(dropout = 0., norm = norm).to(device)          # no dropout, no augmentation - we want memorization
+    model = make_vit(dropout = 0., norm = norm, model = model_name).to(device)          # no dropout, no augmentation - we want memorization
     optimizer = torch.optim.AdamW(model.parameters(), lr = 1e-3, weight_decay = 0.)
 
     x, y = normalize(images), labels
@@ -244,10 +252,10 @@ def train(args, train_images, train_labels, test_images, test_labels, logger):
     print(f'\n=== phase 2: train on CIFAR-10 ({train_images.shape[0]} train / {test_images.shape[0]} test images) ===')
 
     device = train_images.device
-    model = make_vit(norm = args.norm).to(device)
+    model = make_vit(norm = args.norm, model = args.model).to(device)
 
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f'model: {args.norm}-norm ViT with {num_params:,} trainable parameters')
+    print(f'model: {args.norm}-norm {"vit_for_small_dataset.ViT" if args.model == "small" else "ViT"} with {num_params:,} trainable parameters')
 
     # no weight decay on biases, norms, cls token and positional embedding
 
@@ -361,7 +369,8 @@ def main():
             steps = args.overfit_steps,
             device = device,
             logger = logger,
-            norm = args.norm
+            norm = args.norm,
+            model_name = args.model
         )
 
         logger.save()
