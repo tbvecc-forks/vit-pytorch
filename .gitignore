@@ -130,3 +130,6 @@ dmypy.json
 
 # scripts
 *.sh
+
+# training run outputs (metrics, plots, logs) - charts go to PRs as attachments, not commits
+runs/
